@@ -5,7 +5,7 @@ import joblib
 import uuid
 
 def entrenar_y_guardar_modelo():
-    client = bigquery.Client()
+    client = bigquery.Client(location="EU")
     query = "SELECT * FROM `business-intelligence-444511.granier_modelado.Consumo_Semanal_Train`"
     df = client.query(query).to_dataframe()
 
