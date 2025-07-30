@@ -11,7 +11,7 @@ def entrenar_y_guardar_modelo():
 
     # Separar X e y
     X = df[["Lag_1", "Lag_2", "Media_3_Semanas", "Vol_Ym1", "Crecimiento_WoW_Ym1"]]
-    y = df["Volumen"]
+    y = df["Volumen_Semana"]
 
     model = RandomForestRegressor()
     model.fit(X, y)
