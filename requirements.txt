@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-scikit-learn
 pandas
+scikit-learn
 joblib
+google-cloud-bigquery
 google-cloud-storage
