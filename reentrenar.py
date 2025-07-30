@@ -6,7 +6,7 @@ import uuid
 
 def entrenar_y_guardar_modelo():
     client = bigquery.Client(location="EU")
-    query = "SELECT * FROM `business-intelligence-444511.granier_modelado.Consumo_Semanal_Train`"
+    query = "SELECT * FROM `business-intelligence-444511.granier_logistica.ConsumoEntrenamiento_Semanal`"
     df = client.query(query).to_dataframe()
 
     # Separar X e y
