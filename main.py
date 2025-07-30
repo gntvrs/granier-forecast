@@ -7,7 +7,19 @@ import numpy as np
 app = FastAPI()
 
 # Cargar modelo entrenado
-model = joblib.load("modelo_consumo_semanal.pkl")
+from google.cloud import storage
+import tempfile
+
+def load_model_from_gcs(bucket_name, blob_name):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    _, local_path = tempfile.mkstemp()
+    blob.download_to_filename(local_path)
+    return joblib.load(local_path)
+
+model = load_model_from_gcs("granier-modelos", "consumo/modelo_v1_20250730.pkl")
+
 
 class ConsumoInput(BaseModel):
     Lag_1: float
