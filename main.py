@@ -44,11 +44,3 @@ def predecir_consumo(data: ConsumoInput):
     pred = model.predict(df)[0]
     return {"prediccion_volumen_semana": round(pred, 2)}
 
-
-if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8080))  # Cloud Run define PORT=8080
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-
