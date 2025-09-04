@@ -7,3 +7,5 @@ google-cloud-bigquery
 google-cloud-storage
 db-dtypes
 pandas-gbq
+numpy
+pyarrow
