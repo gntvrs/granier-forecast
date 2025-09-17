@@ -78,12 +78,16 @@ def last_weeks_split(df, weeks_holdout=8):
     return train_idx.values, test_idx.values
 
 def evaluate(y_true, y_pred):
+    # sklearn viejo no admite squared=False -> calculemos RMSE a mano
+    mse = mean_squared_error(y_true, y_pred)  # siempre existe
+    rmse = float(np.sqrt(mse))
     return {
         "MAE":  float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": float(mean_squared_error(y_true, y_pred, squared=False)),
+        "RMSE": rmse,
         "R2":   float(r2_score(y_true, y_pred)),
-        "Bias": float(np.mean(y_pred - y_true))
+        "Bias": float(np.mean(y_pred - y_true)),
     }
+
 
 def entrenar_y_guardar_modelo():
     df = load_df_fast()
