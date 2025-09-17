@@ -7,119 +7,129 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 PROJECT = "business-intelligence-444511"
 DATASET = "granier_logistica"
-TABLE   = "ConsumoEntrenamiento_Semanal_V2"
+TABLE   = "ConsumoEntrenamiento_Semanal_V2"   # usa la V2 enriquecida
 BUCKET  = "granier-modelos"
 
-def load_df():
+def load_df_fast():
     client = bigquery.Client(project=PROJECT, location="europe-southwest1")
-    q = f"SELECT * FROM `{PROJECT}.{DATASET}.{TABLE}`"
-    df = client.query(q).to_dataframe()
-    # Orden temporal por fecha ISO de la semana
-    df["Semana_Date"] = pd.to_datetime(df["Semana_Martes"].apply(lambda s: datetime.strptime(s + "-1", "%G-W%V-%u").date()))
+    # Solo columnas necesarias, evita SELECT *
+    q = f"""
+    SELECT
+      Semana_Martes, Articulo, Centro, Grupo_articulo,
+      Volumen_Semana,
+      Lag_1,Lag_2,Lag_3,Lag_4,Lag_5,Lag_6,Lag_7,Lag_8,
+      MA_3,MA_4,MA_6,MA_8,STD_8,Vol_Ym1,Crecimiento_WoW_Ym1
+    FROM `{PROJECT}.{DATASET}.{TABLE}`
+    """
+    df = client.query(q).to_dataframe(create_bqstorage_client=True)
+    # Orden temporal robusto (ISO semana → lunes)
+    df["Semana_Date"] = pd.to_datetime(df["Semana_Martes"].apply(
+        lambda s: datetime.strptime(s + "-1", "%G-W%V-%u").date()
+    ))
     df = df.sort_values(["Semana_Date","Centro","Articulo"]).reset_index(drop=True)
     return df
 
 def build_features(df: pd.DataFrame):
     target = "Volumen_Semana"
-    cat = ["Centro","Grupo_articulo"]                # puedes añadir Articulo como categórica si procede
+    cat = ["Centro","Grupo_articulo"]
     num = [
         "Lag_1","Lag_2","Lag_3","Lag_4","Lag_5","Lag_6","Lag_7","Lag_8",
         "MA_3","MA_4","MA_6","MA_8","STD_8","Vol_Ym1","Crecimiento_WoW_Ym1"
     ]
-    # Filtra filas con NaNs en lags iniciales (o imputa)
-    X = df[cat + num].copy()
+
+    # Opción rápida: descarta primeras filas sin lags en vez de imputar mucho
+    df = df.dropna(subset=["Lag_1","Lag_2","Lag_3"]).copy()
+
+    X = df[cat + num]
     y = df[target].astype(float).values
 
     pre = ColumnTransformer([
-        ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
-                          ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat),
-        ("num", Pipeline([("imp", SimpleImputer(strategy="median"))]), num)
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(handle_unknown="ignore"))
+        ]), cat),
+        ("num", SimpleImputer(strategy="median"), num),
     ])
-    return X, y, pre
 
-def time_series_cv_splits(df, n_splits=5):
-    # CV por semana, manteniendo orden temporal
-    # Usa índices del dataframe ya ordenado
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    return tscv
+    return df, X, y, pre
+
+def last_weeks_split(df, X, y, weeks_holdout=8):
+    # Hold-out simple por tiempo: últimas N semanas como validación
+    last_date = df["Semana_Date"].max()
+    cutoff = last_date - pd.Timedelta(days=7*weeks_holdout)
+    train_idx = df["Semana_Date"] <= cutoff
+    test_idx  = df["Semana_Date"] >  cutoff
+    return train_idx.values, test_idx.values
 
 def evaluate(y_true, y_pred):
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-    r2 = r2_score(y_true, y_pred)
-    return {"MAE": mae, "RMSE": rmse, "R2": r2}
+    return {
+        "MAE":  float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(mean_squared_error(y_true, y_pred, squared=False)),
+        "R2":   float(r2_score(y_true, y_pred)),
+        "Bias": float(np.mean(y_pred - y_true))   # sesgo (negativo = te quedas corto)
+    }
 
-def train_and_save():
-    df = load_df()
-    X, y, pre = build_features(df)
-    splits = time_series_cv_splits(df, n_splits=5)
+def entrenar_y_guardar_modelo_fast():
+    df = load_df_fast()
+    df, X, y, pre = build_features(df)
+    tr, te = last_weeks_split(df, X, y, weeks_holdout=8)
 
-    # ========= Modelo 1: RandomForest (punto) =========
+    # ===== Modelo 1: RF "ligero" =====
     rf = Pipeline(steps=[
         ("pre", pre),
-        ("rf", RandomForestRegressor(random_state=42, n_estimators=400, max_depth=None, n_jobs=-1))
+        ("rf", RandomForestRegressor(
+            n_estimators=200, max_depth=None, min_samples_leaf=2,
+            n_jobs=-1, random_state=42
+        ))
     ])
-    rf_param = {
-        "rf__n_estimators": [400],
-        "rf__max_depth": [None, 12, 18],
-        "rf__min_samples_leaf": [1, 3]
-    }
-    rf_cv = GridSearchCV(rf, rf_param, cv=splits, scoring="neg_mean_absolute_error", n_jobs=-1)
-    rf_cv.fit(X, y)
-    rf_best = rf_cv.best_estimator_
+    rf.fit(X.iloc[tr], y[tr])
+    y_hat_rf_tr = rf.predict(X.iloc[tr])
+    y_hat_rf_te = rf.predict(X.iloc[te])
+    m_rf_tr = evaluate(y[tr], y_hat_rf_tr)
+    m_rf_te = evaluate(y[te], y_hat_rf_te)
 
-    y_pred_rf = rf_best.predict(X)
-    metrics_rf = evaluate(y, y_pred_rf)
-
-    # ========= Modelo 2: GradientBoosting (cuantil 0.75) =========
-    # Sesga la predicción hacia el percentil superior para reducir riesgo de rotura
-    gbr_q = Pipeline(steps=[
+    # ===== Modelo 2: GBR cuantil 0.75 "ligero" =====
+    gbr = Pipeline(steps=[
         ("pre", pre),
-        ("gbr", GradientBoostingRegressor(loss="quantile", alpha=0.75, random_state=42))
+        ("gbr", GradientBoostingRegressor(
+            loss="quantile", alpha=0.75,
+            n_estimators=200, max_depth=2, learning_rate=0.1,
+            random_state=42
+        ))
     ])
-    gbr_param = {
-        "gbr__n_estimators": [300, 500],
-        "gbr__max_depth": [2, 3],
-        "gbr__learning_rate": [0.05, 0.1],
-        "gbr__min_samples_leaf": [1, 3]
-    }
-    gbr_cv = GridSearchCV(gbr_q, gbr_param, cv=splits, scoring="neg_mean_absolute_error", n_jobs=-1)
-    gbr_cv.fit(X, y)
-    gbr_best = gbr_cv.best_estimator_
+    gbr.fit(X.iloc[tr], y[tr])
+    y_hat_gbr_tr = gbr.predict(X.iloc[tr])
+    y_hat_gbr_te = gbr.predict(X.iloc[te])
+    m_gbr_tr = evaluate(y[tr], y_hat_gbr_tr)
+    m_gbr_te = evaluate(y[te], y_hat_gbr_te)
 
-    y_pred_gbr = gbr_best.predict(X)
-    metrics_gbr = evaluate(y, y_pred_gbr)
+    print("RF  (train):", m_rf_tr)
+    print("RF  (valid):", m_rf_te)
+    print("Q75 (train):", m_gbr_tr)
+    print("Q75 (valid):", m_gbr_te)
 
-    print("RF (punto)  ->", metrics_rf)
-    print("GBR (q=0.75)->", metrics_gbr)
-
-    # ========= Guardado a GCS =========
-    ts = pd.Timestamp.today().strftime('%Y%m%d')
+    # ===== Guardado en GCS =====
+    ts  = pd.Timestamp.today().strftime('%Y%m%d')
     uid = uuid.uuid4().hex[:6]
+    rf_name  = f"consumo/modelo_V2_FAST_RF_{ts}_{uid}.pkl"
+    q75_name = f"consumo/modelo_V2_FAST_Q75_{ts}_{uid}.pkl"
+
+    joblib.dump(rf,  "/tmp/rf.pkl")
+    joblib.dump(gbr, "/tmp/q75.pkl")
 
     storage_client = storage.Client(project=PROJECT)
     bucket = storage_client.bucket(BUCKET)
-
-    # RF
-    rf_name = f"consumo/modelo_V2_RF_{ts}_{uid}.pkl"
-    joblib.dump(rf_best, "/tmp/rf.pkl")
     bucket.blob(rf_name).upload_from_filename("/tmp/rf.pkl")
+    bucket.blob(q75_name).upload_from_filename("/tmp/q75.pkl")
 
-    # GBR cuantil
-    gbr_name = f"consumo/modelo_V2_GBRq75_{ts}_{uid}.pkl"
-    joblib.dump(gbr_best, "/tmp/gbr.pkl")
-    bucket.blob(gbr_name).upload_from_filename("/tmp/gbr.pkl")
-
-    # Actualiza punteros “latest”
-    bucket.blob("consumo/last_model_v2_rf.txt").upload_from_string(rf_name.split("/")[-1])
-    bucket.blob("consumo/last_model_v2_gbrq75.txt").upload_from_string(gbr_name.split("/")[-1])
+    bucket.blob("consumo/last_model_v2_fast_rf.txt").upload_from_string(rf_name.split("/")[-1])
+    bucket.blob("consumo/last_model_v2_fast_q75.txt").upload_from_string(q75_name.split("/")[-1])
 
 if __name__ == "__main__":
-    train_and_save()
+    entrenar_y_guardar_modelo_fast()
+
