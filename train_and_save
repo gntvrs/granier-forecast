@@ -12,22 +12,22 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 PROJECT = "business-intelligence-444511"
 DATASET = "granier_logistica"
-TABLE   = "ConsumoEntrenamiento_Semanal_V2"   # usa la V2 enriquecida
+TABLE   = "ConsumoEntrenamiento_Semanal_V2"   # V2 con YoY limpio + shift correcto
 BUCKET  = "granier-modelos"
 
 def load_df_fast():
     client = bigquery.Client(project=PROJECT, location="europe-southwest1")
-    # Solo columnas necesarias, evita SELECT *
     q = f"""
     SELECT
       Semana_Martes, Articulo, Centro, Grupo_articulo,
       Volumen_Semana,
       Lag_1,Lag_2,Lag_3,Lag_4,Lag_5,Lag_6,Lag_7,Lag_8,
-      MA_3,MA_4,MA_6,MA_8,STD_8,Vol_Ym1,Crecimiento_WoW_Ym1
+      MA_3,MA_4,MA_6,MA_8,STD_8,
+      Vol_Ym1_clean, Crec_clean, YoY_level, Delta_MA3_vs_YoY
     FROM `{PROJECT}.{DATASET}.{TABLE}`
     """
     df = client.query(q).to_dataframe(create_bqstorage_client=True)
-    # Orden temporal robusto (ISO semana → lunes)
+    # Semana ISO → lunes (fecha de orden)
     df["Semana_Date"] = pd.to_datetime(df["Semana_Martes"].apply(
         lambda s: datetime.strptime(s + "-1", "%G-W%V-%u").date()
     ))
@@ -38,15 +38,28 @@ def build_features(df: pd.DataFrame):
     target = "Volumen_Semana"
     cat = ["Centro","Grupo_articulo"]
     num = [
+        # señal temporal
         "Lag_1","Lag_2","Lag_3","Lag_4","Lag_5","Lag_6","Lag_7","Lag_8",
-        "MA_3","MA_4","MA_6","MA_8","STD_8","Vol_Ym1","Crecimiento_WoW_Ym1"
+        "MA_3","MA_4","MA_6","MA_8","STD_8",
+        # señal YoY saneada y derivada
+        "Vol_Ym1_clean","Crec_clean","YoY_level","Delta_MA3_vs_YoY",
     ]
 
-    # Opción rápida: descarta primeras filas sin lags en vez de imputar mucho
+    # Exige un mínimo de historia
     df = df.dropna(subset=["Lag_1","Lag_2","Lag_3"]).copy()
+
+    # (debug) columnas numéricas completamente vacías → error explícito
+    empty_full = [c for c in num if c in df.columns and not df[c].notna().any()]
+    if empty_full:
+        raise ValueError(f"Columnas 100% vacías en el dataset: {empty_full}. Revisa la V2 o el rango temporal.")
 
     X = df[cat + num]
     y = df[target].astype(float).values
+
+    # Seguridad: no deben quedar NaNs después del filtro anterior
+    if X.isnull().sum().sum() > 0:
+        # Imputer se encargará de NaNs parciales, pero avisamos si hay demasiados
+        print("[WARN] Quedan NaNs en X tras el filtro; el Imputer los cubrirá.")
 
     pre = ColumnTransformer([
         ("cat", Pipeline([
@@ -55,11 +68,9 @@ def build_features(df: pd.DataFrame):
         ]), cat),
         ("num", SimpleImputer(strategy="median"), num),
     ])
-
     return df, X, y, pre
 
-def last_weeks_split(df, X, y, weeks_holdout=8):
-    # Hold-out simple por tiempo: últimas N semanas como validación
+def last_weeks_split(df, weeks_holdout=8):
     last_date = df["Semana_Date"].max()
     cutoff = last_date - pd.Timedelta(days=7*weeks_holdout)
     train_idx = df["Semana_Date"] <= cutoff
@@ -71,15 +82,17 @@ def evaluate(y_true, y_pred):
         "MAE":  float(mean_absolute_error(y_true, y_pred)),
         "RMSE": float(mean_squared_error(y_true, y_pred, squared=False)),
         "R2":   float(r2_score(y_true, y_pred)),
-        "Bias": float(np.mean(y_pred - y_true))   # sesgo (negativo = te quedas corto)
+        "Bias": float(np.mean(y_pred - y_true))
     }
 
-def entrenar_y_guardar_modelo_fast():
+def entrenar_y_guardar_modelo():
     df = load_df_fast()
+    print(f"[INFO] filas totales: {len(df):,}")
     df, X, y, pre = build_features(df)
-    tr, te = last_weeks_split(df, X, y, weeks_holdout=8)
+    tr, te = last_weeks_split(df, weeks_holdout=8)
+    print(f"[INFO] train: {tr.sum():,}  |  valid: {te.sum():,}")
 
-    # ===== Modelo 1: RF "ligero" =====
+    # ===== RF =====
     rf = Pipeline(steps=[
         ("pre", pre),
         ("rf", RandomForestRegressor(
@@ -88,12 +101,10 @@ def entrenar_y_guardar_modelo_fast():
         ))
     ])
     rf.fit(X.iloc[tr], y[tr])
-    y_hat_rf_tr = rf.predict(X.iloc[tr])
-    y_hat_rf_te = rf.predict(X.iloc[te])
-    m_rf_tr = evaluate(y[tr], y_hat_rf_tr)
-    m_rf_te = evaluate(y[te], y_hat_rf_te)
+    m_rf_tr = evaluate(y[tr], rf.predict(X.iloc[tr]))
+    m_rf_te = evaluate(y[te], rf.predict(X.iloc[te]))
 
-    # ===== Modelo 2: GBR cuantil 0.75 "ligero" =====
+    # ===== GBR cuantil 0.75 =====
     gbr = Pipeline(steps=[
         ("pre", pre),
         ("gbr", GradientBoostingRegressor(
@@ -103,10 +114,8 @@ def entrenar_y_guardar_modelo_fast():
         ))
     ])
     gbr.fit(X.iloc[tr], y[tr])
-    y_hat_gbr_tr = gbr.predict(X.iloc[tr])
-    y_hat_gbr_te = gbr.predict(X.iloc[te])
-    m_gbr_tr = evaluate(y[tr], y_hat_gbr_tr)
-    m_gbr_te = evaluate(y[te], y_hat_gbr_te)
+    m_gbr_tr = evaluate(y[tr], gbr.predict(X.iloc[tr]))
+    m_gbr_te = evaluate(y[te], gbr.predict(X.iloc[te]))
 
     print("RF  (train):", m_rf_tr)
     print("RF  (valid):", m_rf_te)
@@ -131,5 +140,5 @@ def entrenar_y_guardar_modelo_fast():
     bucket.blob("consumo/last_model_v2_fast_q75.txt").upload_from_string(q75_name.split("/")[-1])
 
 if __name__ == "__main__":
-    entrenar_y_guardar_modelo_fast()
+    entrenar_y_guardar_modelo()
 
