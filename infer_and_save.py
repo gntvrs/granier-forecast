@@ -21,14 +21,12 @@ def _load_model_from_txt(txt_blob):
     return joblib.load(tmp), model_name
 
 def _rolling_update(stats, new_val):
-    """Mantiene ventana para MA_3, MA_4, MA_6, MA_8 y STD_8 (8 ultimos valores)."""
     window = stats["window"]
     window.append(float(new_val))
     if len(window) > 8:
         window.pop(0)
-    # Recalcular MAs
     def mean_last(k):
-        w = window[-k:] if len(window) >= 1 else []
+        w = window[-k:] if window else []
         return round(float(np.mean(w)), 2) if w else np.nan
     stats["MA_3"] = mean_last(3)
     stats["MA_4"] = mean_last(4)
@@ -57,57 +55,50 @@ def infer_and_save():
     pred_rows_q75 = []
 
     feature_cols = [
-        # cat + num en el mismo orden que entrenaste el pipeline
-        "Centro","Grupo_articulo",        # categóricas (OneHot en el pipeline)
-        "Lag_1","Lag_2","Lag_3",
+        "Centro","Grupo_articulo",
+        "Lag_1","Lag_2","Lag_3","Lag_4","Lag_5","Lag_6","Lag_7","Lag_8",
         "MA_3","MA_4","MA_6","MA_8","STD_8",
         "Vol_Ym1_clean","Crec_clean","YoY_level","Delta_MA3_vs_YoY"
     ]
 
     for (centro, articulo), g in df.groupby(["Centro","Articulo"], sort=False):
         g = g.copy().reset_index(drop=True)
-
-        # Estado autoregresivo inicial desde la fila 1 (vienen del hist hasta 2025-09-01)
-        lag1 = g.loc[0, "Lag_1"]
-        lag2 = g.loc[0, "Lag_2"]
-        lag3 = g.loc[0, "Lag_3"]
-
-        stats = {
-            "window": [],  # últimos <=8 valores observados/predichos para MAs/STD
-            "MA_3": g.loc[0, "MA_3"],
-            "MA_4": g.loc[0, "MA_4"],
-            "MA_6": g.loc[0, "MA_6"],
-            "MA_8": g.loc[0, "MA_8"],
-            "STD_8": g.loc[0, "STD_8"],
-        }
-
-        # Inicializa ventana si hay lags/MA conocidos
-        base_vals = [v for v in [lag1, lag2, lag3] if pd.notna(v)]
-        for v in base_vals[::-1]:
-            _rolling_update(stats, v)
-
+    
+        # Estado inicial con 8 lags (pueden venir NaN; el imputer del pipeline se encarga)
+        lag1 = g.loc[0, "Lag_1"]; lag2 = g.loc[0, "Lag_2"]; lag3 = g.loc[0, "Lag_3"]; lag4 = g.loc[0, "Lag_4"]
+        lag5 = g.loc[0, "Lag_5"]; lag6 = g.loc[0, "Lag_6"]; lag7 = g.loc[0, "Lag_7"]; lag8 = g.loc[0, "Lag_8"]
+    
+        # Ventana inicial: de más antiguo a más reciente, omitiendo NaN
+        init_vals = [lag8, lag7, lag6, lag5, lag4, lag3, lag2, lag1]
+        stats = {"window": [], "MA_3": g.loc[0, "MA_3"], "MA_4": g.loc[0, "MA_4"], "MA_6": g.loc[0, "MA_6"],
+                 "MA_8": g.loc[0, "MA_8"], "STD_8": g.loc[0, "STD_8"]}
+        for v in init_vals:
+            if pd.notna(v):
+                _rolling_update(stats, v)
+    
         for i in range(len(g)):
             row = g.iloc[i].to_dict()
-
-            # Si faltan lags, usa lo que tengamos en estado actual
-            l1 = lag1
-            l2 = lag2
-            l3 = lag3
-
-            # Si MA_x o STD_8 son NaN, usa del estado
+    
+            # Usa el estado actual de lags (si vienen NaN en la fila, nos da igual: pasamos el estado)
+            lags = {
+                "Lag_1": lag1, "Lag_2": lag2, "Lag_3": lag3, "Lag_4": lag4,
+                "Lag_5": lag5, "Lag_6": lag6, "Lag_7": lag7, "Lag_8": lag8,
+            }
+    
+            # Completa MAs/STD con estado si vienen NaN
             for k in ["MA_3","MA_4","MA_6","MA_8","STD_8"]:
                 if pd.isna(row[k]):
                     row[k] = stats[k]
-
-            # Construye X (el pipeline hará OneHot/Imputer)
-            X_row = {**{c: row[c] for c in ["Centro","Grupo_articulo"]},
-                     **{"Lag_1": l1, "Lag_2": l2, "Lag_3": l3,
-                        "MA_3": row["MA_3"], "MA_4": row["MA_4"], "MA_6": row["MA_6"], "MA_8": row["MA_8"], "STD_8": row["STD_8"],
-                        "Vol_Ym1_clean": row["Vol_Ym1_clean"], "Crec_clean": row["Crec_clean"],
-                        "YoY_level": row["YoY_level"], "Delta_MA3_vs_YoY": row["Delta_MA3_vs_YoY"]}}
+    
+            X_row = {
+                "Centro": row["Centro"], "Grupo_articulo": row["Grupo_articulo"],
+                **lags,
+                "MA_3": row["MA_3"], "MA_4": row["MA_4"], "MA_6": row["MA_6"], "MA_8": row["MA_8"], "STD_8": row["STD_8"],
+                "Vol_Ym1_clean": row["Vol_Ym1_clean"], "Crec_clean": row["Crec_clean"],
+                "YoY_level": row["YoY_level"], "Delta_MA3_vs_YoY": row["Delta_MA3_vs_YoY"],
+            }
             X_df = pd.DataFrame([X_row], columns=feature_cols)
-
-            # Predicciones
+    
             yhat_rf  = float(rf.predict(X_df)[0])
             yhat_q75 = float(q75.predict(X_df)[0])
 
@@ -126,13 +117,9 @@ def infer_and_save():
             # === UPDATE AUTORREGRESIVO PARA LA SIGUIENTE SEMANA ===
             # Avanza lags con la predicción del modelo “central” (RF) o podrías usar blend.
             # Aquí usamos RF como truth interno para mantener consistencia.
-            pred_for_state = yhat_rf
-
-            lag3 = lag2
-            lag2 = lag1
-            lag1 = pred_for_state
-
-            _rolling_update(stats, pred_for_state)
+            pred_state = yhat_rf
+            lag8, lag7, lag6, lag5, lag4, lag3, lag2, lag1 = lag7, lag6, lag5, lag4, lag3, lag2, lag1, pred_state
+            _rolling_update(stats, pred_state)
 
     # Subir a BigQuery
     df_rf = pd.DataFrame(pred_rows_rf)
